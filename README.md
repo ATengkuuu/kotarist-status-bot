@@ -1,0 +1,2 @@
+# kotaku-discord-bot
+BOT UNTUK SERVER KOTAKU ROLEPLAY
