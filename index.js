@@ -25,13 +25,13 @@ const client = new Client({
 
 // Validasi environment variables
 if (!BOT_TOKEN || !CHANNEL_ID || !CFX_SERVER_ID) {
-    console.error('❌ ERROR: Environment variables tidak lengkap!');
+    console.error('ERROR: Environment variables tidak lengkap!');
     console.error('Pastikan file .env sudah dibuat dengan benar.');
     console.error('Yang diperlukan: BOT_TOKEN, CHANNEL_ID, CFX_SERVER_ID');
     process.exit(1);
 }
 
-// Fungsi kirim notifikasi ke webhook
+// Fungsi kirim notifikasi ke webhook (untuk event/alert)
 async function sendWebhook(title, description, color, fields = []) {
     if (!WEBHOOK_URL) return; // Skip jika webhook tidak ada
     
@@ -57,8 +57,139 @@ async function sendWebhook(title, description, color, fields = []) {
     }
 }
 
+// Fungsi update status live di webhook
+async function updateWebhookStatus(status) {
+    if (!WEBHOOK_URL) return;
+    
+    try {
+        // Tentukan warna embed berdasarkan status
+        let embedColor = 0x00FF00; // Hijau (Online)
+        let statusEmoji = "🟢";
+        let statusText = "ONLINE";
+        
+        if (status.maintenance) {
+            embedColor = 0xFFA500; // Orange
+            statusEmoji = "🟠";
+            statusText = "MAINTENANCE";
+        } else if (status.adminOnly) {
+            embedColor = 0xFFFF00; // Kuning
+            statusEmoji = "🟡";
+            statusText = "ADMIN ONLY";
+        } else if (!status.online) {
+            embedColor = 0xFF0000; // Merah
+            statusEmoji = "🔴";
+            statusText = "OFFLINE";
+        }
+        
+        // Hitung rata-rata dan tertinggi player
+        const avgPlayers = playerStats.count > 0 ? (playerStats.total / playerStats.count).toFixed(1) : 0;
+        const botUptime = await getBotUptime();
+        
+        const embed = {
+            title: "🎮 Kotarist Roleplay — Live Status",
+            description: `Update otomatis setiap 30 detik`,
+            color: embedColor,
+            fields: [
+                {
+                    name: "📊 STATUS SERVER",
+                    value: `${statusEmoji} **${statusText}**`,
+                    inline: true
+                },
+                {
+                    name: "👥 PLAYERS ONLINE",
+                    value: `**${status.players}** / **${status.maxPlayers}**`,
+                    inline: true
+                },
+                {
+                    name: "⏱️ SERVER UPTIME",
+                    value: `${status.online ? formatUptime(status.uptime) : '0h 0m'}`,
+                    inline: true
+                },
+                {
+                    name: "📊 RATA-RATA PLAYER",
+                    value: `${avgPlayers} player`,
+                    inline: true
+                },
+                {
+                    name: "🏆 PLAYER TERTINGGI",
+                    value: playerStats.highestTime 
+                        ? `${playerStats.highest} player\n⏰ ${playerStats.highestTime.toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', timeZoneName: 'short' })}`
+                        : `${playerStats.highest} player`,
+                    inline: true
+                },
+                {
+                    name: "🤖 BOT UPTIME",
+                    value: botUptime,
+                    inline: true
+                }
+            ],
+            timestamp: new Date().toISOString(),
+            footer: {
+                text: "Kotarist Roleplay • Live Status"
+            }
+        };
+        
+        // Tambahkan info maintenance atau admin only jika ada
+        if (status.maintenance) {
+            embed.fields.push({
+                name: "ℹ️ INFO PERBAIKAN",
+                value: status.maintenanceReason || 'Server sedang dalam perbaikan',
+                inline: false
+            });
+        }
+        
+        if (status.adminOnly) {
+            embed.fields.push({
+                name: "ℹ️ INFO ADMIN ONLY",
+                value: status.adminReason || 'Server hanya untuk admin sementara',
+                inline: false
+            });
+        }
+        
+        // Jika sudah ada message, edit. Jika belum, kirim baru
+        if (webhookMessageId) {
+            // Edit message yang sudah ada
+            try {
+                await axios.patch(`${WEBHOOK_URL}/messages/${webhookMessageId}`, {
+                    embeds: [embed]
+                });
+                console.log(`[Webhook] Status diupdate: ${status.players}/${status.maxPlayers} players`);
+            } catch (editError) {
+                // Jika gagal edit (message dihapus), kirim baru
+                console.log(`[Webhook] Gagal edit, kirim message baru`);
+                const response = await axios.post(WEBHOOK_URL + '?wait=true', {
+                    embeds: [embed]
+                });
+                webhookMessageId = response.data.id;
+            }
+        } else {
+            // Kirim message baru dan simpan ID-nya
+            const response = await axios.post(WEBHOOK_URL + '?wait=true', {
+                embeds: [embed]
+            });
+            webhookMessageId = response.data.id;
+            console.log(`[Webhook] Live status message dibuat: ID ${webhookMessageId}`);
+        }
+    } catch (error) {
+        console.error(`[Webhook Error] Gagal update status: ${error.message}`);
+    }
+}
+
 let botStartTime = Date.now();
 let lastKnownStatus = null; // Track status terakhir
+let webhookMessageId = null; // Track message ID webhook untuk edit
+let webhookMessageToken = null; // Track message token webhook
+
+// Tracking statistik player
+let playerStats = {
+    records: [],
+    highest: 0,
+    highestTime: null, // Waktu player tertinggi tercapai
+    total: 0,
+    count: 0,
+    lastRecordedCount: null, // Player count terakhir yang dicatat
+    lastRecordTime: null // Waktu pencatatan terakhir
+};
 
 async function getBotUptime() {
     const uptimeMs = Date.now() - botStartTime;
@@ -88,6 +219,31 @@ async function fetchServerData() {
         const serverUptime = parseInt(serverData.vars?.uptime) || 0;
         
         console.log(`[CFX API] Successfully fetched: ${players}/${maxPlayers} players, Uptime: ${formatUptime(serverUptime)}`);
+        
+        // Catat statistik player HANYA jika:
+        // 1. Ada perubahan player count ATAU
+        // 2. Sudah lewat 5 menit sejak pencatatan terakhir
+        const now = Date.now();
+        const shouldRecord = 
+            playerStats.lastRecordedCount === null || // Pencatatan pertama
+            playerStats.lastRecordedCount !== players || // Ada perubahan player
+            (now - (playerStats.lastRecordTime || 0)) >= 300000; // Sudah 5 menit (300000ms)
+        
+        if (shouldRecord) {
+            playerStats.records.push(players);
+            playerStats.total += players;
+            playerStats.count++;
+            playerStats.lastRecordedCount = players;
+            playerStats.lastRecordTime = now;
+            
+            console.log(`[Statistik] Tercatat: ${players} players (Total data: ${playerStats.count})`);
+        }
+        
+        // Update player tertinggi (selalu check, tidak perlu tunggu 5 menit)
+        if (players > playerStats.highest) {
+            playerStats.highest = players;
+            playerStats.highestTime = new Date();
+        }
         
         return {
             online: true,
@@ -173,38 +329,38 @@ async function buildEmbed() {
 
     // Tentukan Status Text
     let statusTitle = "🔴 Offline";
-    let statusValue = "Offline";
+    let statusValue = "🔴 OFFLINE";
 
     if (status.maintenance) {
-        statusTitle = "🔴 Maintenance";
-        statusValue = "🔧 Maintenance Mode";
+        statusTitle = "🟠 Maintenance";
+        statusValue = "🟠 MAINTENANCE";
     } else if (status.adminOnly) {
         // Jika server online tapi file admin ada
         if (status.online) {
             statusTitle = "🟡 Admin Only";
-            statusValue = "🛡️ Online (Restricted)";
+            statusValue = "🟡 ADMIN ONLY";
         } else {
-            statusTitle = "🟡 Admin Only (Offline)";
-            statusValue = "🛡️ Server Offline";
+            statusTitle = "🔴 Admin Only (Offline)";
+            statusValue = "🔴 OFFLINE";
         }
     } else if (status.online) {
         statusTitle = "🟢 Online";
-        statusValue = "✅ Public Server";
+        statusValue = "🟢 ONLINE";
     }
 
     const embed = new EmbedBuilder()
         .setColor(embedColor)
-        .setTitle("✨ **Kotarist Roleplay** — Server Status ✨")
+        .setTitle("Kotarist Roleplay — Server Status")
         .setThumbnail(LOGO_URL)
         .setImage(BG_URL)
         .addFields(
             {
-                name: "📡 Status Server",
+                name: "STATUS",
                 value: `\`\`\`\n${statusValue}\n\`\`\``,
                 inline: true
             },
             {
-                name: "👥 Players",
+                name: "PLAYERS",
                 value: `\`\`\`\n${status.players} / ${status.maxPlayers}\n\`\`\``,
                 inline: true
             }
@@ -213,7 +369,7 @@ async function buildEmbed() {
     // Tambahkan field khusus jika ada maintenance atau admin only
     if (status.maintenance) {
         embed.addFields({
-            name: "🔧 Info Perbaikan", 
+            name: "INFO PERBAIKAN", 
             value: `\`\`\`\n${status.maintenanceReason}\n\`\`\``,
             inline: false
         });
@@ -221,7 +377,7 @@ async function buildEmbed() {
 
     if (status.adminOnly) {
         embed.addFields({
-            name: "🛡️ Info Admin Only",
+            name: "INFO ADMIN ONLY",
             value: `\`\`\`\n${status.adminReason}\n\`\`\``,
             inline: false
         });
@@ -230,27 +386,27 @@ async function buildEmbed() {
     // Field Connect & Info lainnya
     embed.addFields(
         {
-            name: "🎮 F8 CONNECT (MAIN)",
+            name: "F8 Connect Server - Alternative 1",
             value: "```\nconnect kotaku.mayernetwork.net\n```",
             inline: false
         },
         {
-            name: "🎮 F8 CONNECT (PROXY)",
-            value: "```\nconnect kotaku-global.mayernetwork.net\n```",
+            name: "F8 Connect Server - Alternative 2",
+            value: "```\nconnect kotaku-asia.mayernetwork.net\n```",
             inline: false
         },
         {
-            name: "⏳ Restart Info",
+            name: "RESTART INFO",
             value: `Cek pengumuman restart di <#1444684560418865245>`,
             inline: false
         },
         {
-            name: "⏰ Server Uptime",
+            name: "SERVER UPTIME",
             value: `\`\`\`\n${status.online ? formatUptime(status.uptime) : '0h 0m'}\n\`\`\``,
             inline: false
         }
     )
-    .setFooter({ text: "Kotarist Roleplay • Update setiap 1 menit" })
+    .setFooter({ text: "Kotarist Roleplay • Update setiap 30 detik" })
     .setTimestamp();
 
     return embed;
@@ -262,22 +418,22 @@ async function updateBotPresence() {
         let activityName;
 
         if (status.maintenance) {
-            activityName = "🔧 Server Maintenance";
+            activityName = `[${status.players}/${status.maxPlayers}] on KOTARIST (Maintenance)`;
         } else if (status.adminOnly) {
             // Tampilkan player count juga saat admin only jika server online
             if (status.online) {
-                activityName = `🛡️ Admin Only (${status.players}/${status.maxPlayers})`;
+                activityName = `[${status.players}/${status.maxPlayers}] on KOTARIST (Admin Only)`;
             } else {
-                activityName = "🛡️ Admin Only (Offline)";
+                activityName = "[0/0] on KOTARIST (Offline)";
             }
         } else if (status.online) {
-            activityName = `${status.players}/${status.maxPlayers} Players Online`;
+            activityName = `[${status.players}/${status.maxPlayers}] on KOTARIST`;
         } else {
-            activityName = "🔴 Server Offline";
+            activityName = "[0/0] on KOTARIST (Offline)";
         }
         
         client.user.setPresence({
-            status: status.maintenance ? "dnd" : (status.online ? "online" : "idle"),
+            status: "online",
             activities: [{
                 name: activityName,
                 type: 3 // Watching
@@ -302,20 +458,20 @@ async function update() {
         if (lastKnownStatus !== null) {
             if (lastKnownStatus.online !== status.online) {
                 if (status.online) {
-                    console.log("✅ Server kembali online!");
+                    console.log("Server kembali online!");
                     await sendWebhook(
-                        "✅ Server Online",
+                        "Server Online",
                         "Server Kotarist Roleplay kembali online!",
                         0x00FF00, // Hijau
                         [
-                            { name: "👥 Players", value: `${status.players}/${status.maxPlayers}`, inline: true },
-                            { name: "⏰ Uptime", value: formatUptime(status.uptime), inline: true }
+                            { name: "Players", value: `${status.players}/${status.maxPlayers}`, inline: true },
+                            { name: "Uptime", value: formatUptime(status.uptime), inline: true }
                         ]
                     );
                 } else {
-                    console.log("🔴 Server offline terdeteksi!");
+                    console.log("Server offline terdeteksi!");
                     await sendWebhook(
-                        "🔴 Server Offline",
+                        "Server Offline",
                         "Server Kotarist Roleplay sedang offline atau tidak dapat diakses.",
                         0xFF0000 // Merah
                     );
@@ -323,22 +479,22 @@ async function update() {
             }
             
             if (!lastKnownStatus.maintenance && status.maintenance) {
-                console.log("🔧 Server masuk mode maintenance");
+                console.log("Server masuk mode maintenance");
                 await sendWebhook(
-                    "🔧 Maintenance Mode",
+                    "Maintenance Mode",
                     `Server masuk mode maintenance.\n\n**Alasan:** ${status.maintenanceReason}`,
                     0xFFA500 // Orange
                 );
             }
             
             if (!lastKnownStatus.adminOnly && status.adminOnly) {
-                console.log("🛡️ Server masuk mode Admin Only");
+                console.log("Server masuk mode Admin Only");
                 await sendWebhook(
-                    "🛡️ Admin Only Mode",
+                    "Admin Only Mode",
                     `Server masuk mode Admin Only.\n\n**Alasan:** ${status.adminReason}`,
                     0xFFFF00, // Kuning
                     [
-                        { name: "👥 Players", value: `${status.players}/${status.maxPlayers}`, inline: true }
+                        { name: "Players", value: `${status.players}/${status.maxPlayers}`, inline: true }
                     ]
                 );
             }
@@ -349,7 +505,7 @@ async function update() {
         const embed = await buildEmbed();
         const row = new ActionRowBuilder().addComponents(
             new ButtonBuilder()
-                .setLabel("🚀 CONNECT SERVER")
+                .setLabel("CONNECT SERVER")
                 .setStyle(ButtonStyle.Link)
                 .setURL("https://cfx.re/join/8r7365")
         );
@@ -366,6 +522,9 @@ async function update() {
         }
         
         await updateBotPresence();
+        
+        // Update webhook status setiap update
+        await updateWebhookStatus(status);
     } catch (error) {
         console.log("Error pada fungsi update utama:", error.message);
     }
@@ -374,30 +533,30 @@ async function update() {
 client.on("clientReady", async () => {
     console.log(`Bot online sebagai ${client.user.tag}`);
     botStartTime = Date.now();
-    console.log("🚀 Bot berhasil online!");
+    console.log("Bot berhasil online!");
     
     // Kirim webhook notifikasi bot startup
     const initialStatus = await getStatus();
     if (initialStatus.online) {
         await sendWebhook(
-            "🚀 Bot Online - Server Status",
-            `Bot berhasil startup!\n\n**Status Server:** ${initialStatus.maintenance ? '🔧 Maintenance' : (initialStatus.adminOnly ? '🛡️ Admin Only' : '🟢 Public Online')}`,
+            "Bot Online - Server Status",
+            `Bot berhasil startup!\n\n**Status Server:** ${initialStatus.maintenance ? 'Maintenance' : (initialStatus.adminOnly ? 'Admin Only' : 'Public Online')}`,
             0x00BFFF, // Biru
             [
-                { name: "👥 Players", value: `${initialStatus.players}/${initialStatus.maxPlayers}`, inline: true },
-                { name: "⏰ Uptime", value: formatUptime(initialStatus.uptime), inline: true }
+                { name: "Players", value: `${initialStatus.players}/${initialStatus.maxPlayers}`, inline: true },
+                { name: "Uptime", value: formatUptime(initialStatus.uptime), inline: true }
             ]
         );
     } else {
         await sendWebhook(
-            "🚀 Bot Online - Server Offline",
+            "Bot Online - Server Offline",
             "Bot berhasil startup tapi server sedang offline.",
             0xFF0000 // Merah
         );
     }
     
     update();
-    setInterval(update, 60000);
+    setInterval(update, 30000); // Update setiap 30 detik untuk response lebih cepat
 });
 
 // Log error yang tidak tertangani
@@ -415,11 +574,11 @@ client.on('disconnect', async () => {
     console.log('Bot disconnected from Discord');
     const botUptime = formatUptime((Date.now() - botStartTime) / 1000);
     await sendWebhook(
-        "⚠️ Bot Terputus dari Discord",
+        "Bot Terputus dari Discord",
         "Bot terputus dari Discord.",
         0xFFA500,
         [
-            { name: "⏰ Bot Uptime", value: botUptime, inline: true }
+            { name: "Bot Uptime", value: botUptime, inline: true }
         ]
     );
 });
@@ -433,14 +592,36 @@ client.on('error', (error) => {
 process.on('SIGINT', async () => {
     console.log('Received SIGINT, shutting down gracefully...');
     const botUptime = formatUptime((Date.now() - botStartTime) / 1000);
+    
+    // Hitung statistik player
+    const avgPlayers = playerStats.count > 0 ? (playerStats.total / playerStats.count).toFixed(1) : 0;
+    const highestPlayers = playerStats.highest;
+    const highestTimeStr = playerStats.highestTime 
+        ? playerStats.highestTime.toLocaleString('id-ID', { 
+            hour: '2-digit', 
+            minute: '2-digit',
+            day: '2-digit',
+            month: '2-digit',
+            year: 'numeric',
+            timeZoneName: 'short'
+          })
+        : 'Belum tercatat';
+    
+    const fields = [
+        { name: "Bot Berjalan Selama", value: botUptime, inline: true },
+        { name: "Waktu Shutdown", value: new Date().toLocaleString('id-ID'), inline: true },
+        { name: "\u200B", value: "\u200B", inline: false },
+        { name: "📊 Statistik Player", value: "Data selama bot berjalan", inline: false },
+        { name: "Rata-rata Player", value: `${avgPlayers} player`, inline: true },
+        { name: "Player Tertinggi", value: `${highestPlayers} player\n🕐 ${highestTimeStr}`, inline: true },
+        { name: "Total Data Tercatat", value: `${playerStats.count} kali update`, inline: true }
+    ];
+    
     await sendWebhook(
-        "🛑 Bot Offline (Manual Shutdown)",
+        "Bot Offline (Manual Shutdown)",
         "Bot dimatikan secara manual.",
         0xFF0000,
-        [
-            { name: "⏰ Bot Berjalan Selama", value: botUptime, inline: true },
-            { name: "📅 Waktu Shutdown", value: new Date().toLocaleString('id-ID'), inline: true }
-        ]
+        fields
     );
     await client.destroy();
     process.exit(0);
@@ -449,14 +630,36 @@ process.on('SIGINT', async () => {
 process.on('SIGTERM', async () => {
     console.log('Received SIGTERM, shutting down gracefully...');
     const botUptime = formatUptime((Date.now() - botStartTime) / 1000);
+    
+    // Hitung statistik player
+    const avgPlayers = playerStats.count > 0 ? (playerStats.total / playerStats.count).toFixed(1) : 0;
+    const highestPlayers = playerStats.highest;
+    const highestTimeStr = playerStats.highestTime 
+        ? playerStats.highestTime.toLocaleString('id-ID', { 
+            hour: '2-digit', 
+            minute: '2-digit',
+            day: '2-digit',
+            month: '2-digit',
+            year: 'numeric',
+            timeZoneName: 'short'
+          })
+        : 'Belum tercatat';
+    
+    const fields = [
+        { name: "Bot Berjalan Selama", value: botUptime, inline: true },
+        { name: "Waktu Shutdown", value: new Date().toLocaleString('id-ID'), inline: true },
+        { name: "\u200B", value: "\u200B", inline: false },
+        { name: "📊 Statistik Player", value: "Data selama bot berjalan", inline: false },
+        { name: "Rata-rata Player", value: `${avgPlayers} player`, inline: true },
+        { name: "Player Tertinggi", value: `${highestPlayers} player\n🕐 ${highestTimeStr}`, inline: true },
+        { name: "Total Data Tercatat", value: `${playerStats.count} kali update`, inline: true }
+    ];
+    
     await sendWebhook(
-        "🛑 Bot Offline (System Shutdown)",
+        "Bot Offline (System Shutdown)",
         "Bot dimatikan oleh sistem.",
         0xFF0000,
-        [
-            { name: "⏰ Bot Berjalan Selama", value: botUptime, inline: true },
-            { name: "📅 Waktu Shutdown", value: new Date().toLocaleString('id-ID'), inline: true }
-        ]
+        fields
     );
     await client.destroy();
     process.exit(0);
